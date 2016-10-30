@@ -177,7 +177,7 @@ func (px *Paxos) Start(seq int, v interface{}) {
 		var replyValue interface{}
 		for _, value := range prepareAcks {
 			if maxNum <= value.AckNum {
-				replyValue = value
+				replyValue = value.Value
 			}
 		}
 
