@@ -31,7 +31,6 @@ import "sync/atomic"
 import "fmt"
 import "math/rand"
 
-
 // px.Status() return values, indicating
 // whether an agreement has been decided,
 // or Paxos has not yet reached agreement,
@@ -45,16 +44,20 @@ const (
 )
 
 type Paxos struct {
-	mu         sync.Mutex
-	l          net.Listener
-	dead       int32 // for testing
-	unreliable int32 // for testing
-	rpcCount   int32 // for testing
-	peers      []string
-	me         int // index into peers[]
-
+	mu          sync.Mutex
+	l           net.Listener
+	dead        int32 // for testing
+	unreliable  int32 // for testing
+	rpcCount    int32 // for testing
+	peers       []string
+	me          int // index into peers[]
 
 	// Your data here.
+	acceptValue interface{}
+	pNmu        int
+	minNum int
+
+	decidedValues map[int]interface{}
 }
 
 //
@@ -93,6 +96,48 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 	return false
 }
 
+func (px *Paxos) Prepare(req *PrepareR, reply *PrepareAck) error {
+
+	px.mu.Lock()
+	defer px.mu.Unlock()
+	if px.minNum != 0{
+		px.minNum = req.Num
+	}
+	if req.Num >= px.pNmu {
+		px.pNmu = req.Num
+		reply.AckNum = px.pNmu
+		if px.acceptValue != nil{
+			reply.Value = px.acceptValue
+
+		}
+		return nil
+	}
+
+	reply.AckNum = -1
+	return nil
+}
+
+func (px *Paxos) Accept(req *AcceptR, reply *AcceptAck) error {
+
+	px.mu.Lock()
+	defer px.mu.Unlock()
+	if req.Num >= px.pNmu {
+		px.pNmu = req.Num
+		px.acceptValue = req.Value
+		return nil
+	}
+	reply.AckNum = -1
+	return nil
+}
+
+func (px *Paxos) Decide(req *AcceptR, reply *AcceptAck) error {
+
+	px.mu.Lock()
+	defer px.mu.Unlock()
+	px.acceptValue = nil
+	px.decidedValues[req.Num]=req.Value
+	return nil
+}
 
 //
 // the application wants paxos to start agreement on
@@ -103,7 +148,80 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 //
 func (px *Paxos) Start(seq int, v interface{}) {
 	// Your code here.
+
+	go func() {
+		fmt.Printf("%d-----\n",seq)
+
+		prepareAcks := make(map[string]*PrepareAck)
+
+		for index, peer := range px.peers {
+			prepare := &PrepareR{Num: seq}
+			reply := &PrepareAck{}
+
+			if index == px.me {
+				px.Prepare(prepare,reply)
+				prepareAcks[peer] = reply
+				continue
+			}
+			if success := call(peer, "Paxos.Prepare", prepare, reply); success && reply.AckNum != -1 {
+				prepareAcks[peer] = reply
+			}
+		}
+
+		if len(prepareAcks) < ((len(px.peers) / 2) + 1) {
+			// todo 应该
+			return
+		}
+
+		maxNum := seq
+		var replyValue interface{}
+		for _, value := range prepareAcks {
+			if maxNum <= value.AckNum {
+				replyValue = value
+			}
+		}
+
+		acceptCount := 0
+		for index, peer := range px.peers {
+			acceptAck := &AcceptAck{}
+			acceptReq:=&AcceptR{Num: seq, Value: replyValue}
+
+			if index == px.me {
+				px.Accept(acceptReq,acceptAck)
+				acceptCount++
+				continue
+			}
+			if success := call(peer, "Paxos.Accept", acceptReq, acceptAck);
+				success && acceptAck.AckNum != -1 {
+				acceptCount++
+				continue
+			}
+		}
+		if acceptCount >= ((len(px.peers) / 2) + 1) {
+			// todo 应该
+			px.pNmu = seq
+			px.acceptValue = replyValue
+			acceptAck := &AcceptAck{}
+			acceptReq:=&AcceptR{Num: seq, Value: replyValue}
+			for index,peer := range px.peers{
+				if index == px.me {
+					px.Decide(acceptReq,acceptAck)
+					acceptCount++
+					break
+				}
+				if success := call(peer, "Paxos.Decide", acceptReq, acceptAck);
+					success && acceptAck.AckNum != -1 {
+					acceptCount++
+					continue
+				}
+			}
+		}
+
+	}()
+
 }
+
+//func promiseAccept()
 
 //
 // the application on this machine is done with
@@ -112,7 +230,8 @@ func (px *Paxos) Start(seq int, v interface{}) {
 // see the comments for Min() for more explanation.
 //
 func (px *Paxos) Done(seq int) {
-	// Your code here.
+	px.minNum = 0
+	px.pNmu = 0
 }
 
 //
@@ -122,7 +241,7 @@ func (px *Paxos) Done(seq int) {
 //
 func (px *Paxos) Max() int {
 	// Your code here.
-	return 0
+	return px.pNmu
 }
 
 //
@@ -155,7 +274,7 @@ func (px *Paxos) Max() int {
 //
 func (px *Paxos) Min() int {
 	// You code here.
-	return 0
+	return px.minNum
 }
 
 //
@@ -166,11 +285,15 @@ func (px *Paxos) Min() int {
 // it should not contact other Paxos peers.
 //
 func (px *Paxos) Status(seq int) (Fate, interface{}) {
+	if v,ok:=px.decidedValues[seq];ok{
+		return Decided,v
+	}
+	if seq>=px.minNum&&seq<=px.pNmu{
+		return Pending,nil
+	}
 	// Your code here.
-	return Pending, nil
+	return Forgotten, nil
 }
-
-
 
 //
 // tell the peer to shut itself down.
@@ -214,7 +337,9 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
 	px.peers = peers
 	px.me = me
 
-
+	px.decidedValues = make(map[int]interface{})
+	px.pNmu = 0
+	px.minNum = 0
 	// Your initialization code here.
 
 	if rpcs != nil {
@@ -267,7 +392,6 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
 			}
 		}()
 	}
-
 
 	return px
 }
